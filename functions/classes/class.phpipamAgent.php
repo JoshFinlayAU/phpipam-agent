@@ -1285,6 +1285,9 @@ class phpipamAgent extends Common_functions {
 		$Addresses = new Addresses ($this->Database);
 
 		$inserted = 0; $updated = 0; $touched_subnets = array();
+		// decimal IPs we have already fping-checked, so the static-address
+		// status pass (update mode) doesn't ping the same host twice
+		$pinged = array();
 
 		foreach ($leases as $lease) {
 			// RouterOS uses 'address' for the leased IP
@@ -1312,6 +1315,7 @@ class phpipamAgent extends Common_functions {
 			// online status
 			if ($ping_check) {
 				$online = $this->Scan->ping_address ($ip_dotted) == 0;
+				$pinged[$ip_decimal] = true;
 			} else {
 				// trust the RouterOS lease status when not pinging
 				$online = isset($lease['status']) ? ($lease['status'] === "bound") : true;
@@ -1364,15 +1368,77 @@ class phpipamAgent extends Common_functions {
 			$touched_subnets[$subnetId] = true;
 		}
 
+		// in update mode, also refresh the online status of addresses that
+		// already exist in phpipam (e.g. statically/manually added hosts),
+		// not just the ones backed by a MikroTik lease
+		$status_checked = 0;
+		if (!$insert_new && $ping_check) {
+			$status_checked = $this->mikrotik_update_static_addresses ($subnets, $Addresses, $pinged, $touched_subnets);
+		}
+
 		// update subnet scan timestamps
 		foreach (array_keys($touched_subnets) as $sid) {
 			if ($insert_new)	{ $this->update_subnet_discovery_scantime ($sid); }
 			else				{ $this->update_subnet_status_scantime ($sid); }
 		}
 
-		$this->print_success ("MikroTik DHCP import complete: ".$inserted." inserted, ".$updated." updated.");
+		$summary = "MikroTik DHCP import complete: ".$inserted." inserted, ".$updated." updated.";
+		if (!$insert_new && $ping_check) {
+			$summary .= " ".$status_checked." existing address statuses checked.";
+		}
+		$this->print_success ($summary);
 
 		return true;
+	}
+
+	/**
+	 * Pings addresses already present in phpipam (for the agent's subnets) and
+	 * refreshes their lastSeen status. Used in "update" mode so that
+	 * statically/manually added hosts are status-checked too, not only the
+	 * addresses backed by a MikroTik DHCP lease.
+	 *
+	 *	Addresses already fping-checked while processing leases are skipped.
+	 *	Matching the ICMP update behaviour, only addresses that respond have
+	 *	their lastSeen advanced; offline addresses are left untouched.
+	 *
+	 * @access private
+	 * @param array     $subnets        agent subnets
+	 * @param Addresses $Addresses
+	 * @param array     $pinged         decimal IPs already checked (by reference set)
+	 * @param array     $touched_subnets subnets to flag as scanned (modified)
+	 * @return int number of addresses pinged here
+	 */
+	private function mikrotik_update_static_addresses ($subnets, $Addresses, $pinged, &$touched_subnets) {
+		$checked = 0;
+		if (!is_array($subnets)) {
+			return $checked;
+		}
+		foreach ($subnets as $s) {
+			$existing = $Addresses->fetch_subnet_addresses ($s->id, null, null, array("id", "ip_addr"));
+			if (!is_array($existing)) {
+				continue;
+			}
+			foreach ($existing as $addr) {
+				// skip anything already pinged during lease processing
+				if (isset($pinged[$addr->ip_addr])) {
+					continue;
+				}
+				$ip_dotted = $this->transform_to_dotted ($addr->ip_addr);
+				// fping only handles IPv4 here
+				if (filter_var($ip_dotted, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+					continue;
+				}
+				$pinged[$addr->ip_addr] = true;
+				$checked++;
+				// only advance lastSeen for hosts that respond
+				if ($this->Scan->ping_address ($ip_dotted) == 0) {
+					try { $this->Database->updateObject("ipaddresses", array("id"=>$addr->id, "lastSeen"=>$this->nowdate), "id"); }
+					catch (Exception $e) { $this->Result->throw_exception (500, "Error: ".$e->getMessage()); }
+					$touched_subnets[$s->id] = true;
+				}
+			}
+		}
+		return $checked;
 	}
 
 	/**
