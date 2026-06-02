@@ -66,6 +66,8 @@ How it works:
    lease into the subnets assigned to this scan agent.
  - Leases are tagged **dynamic** or **static** (RouterOS `dynamic` flag): the lease type is written
    into the address description and the matching phpipam IP tag is applied.
+ - For **static** leases, if the RouterOS lease has a `comment` it is used as the address
+   description instead of the default label; otherwise the default `"... (static)"` label is used.
  - The MAC address and host-name from the lease are stored on the address.
  - When `ping_check` is enabled each leased address is fping-checked to set its online/offline
    status, so `$config['pingpath']` must point at the `fping` binary. When disabled, the RouterOS
