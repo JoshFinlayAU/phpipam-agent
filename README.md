@@ -74,6 +74,10 @@ How it works:
    lease `status` (`bound`) is used instead.
  - `discover` inserts new leases and updates existing addresses; `update` only refreshes addresses
    that already exist in the database.
+ - In `update` mode, when `ping_check` is enabled, every address that already exists in phpipam for
+   the agent's subnets is also fping-checked (not just lease-backed addresses), so statically/manually
+   added hosts get their online/offline status refreshed too. As with the ICMP update, only addresses
+   that respond have their `lastSeen` advanced.
 
 Notes:
 
