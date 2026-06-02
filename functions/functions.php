@@ -56,6 +56,7 @@ require( dirname(__FILE__) . '/classes/class.Subnets.php' );
 require( dirname(__FILE__) . '/classes/class.Result.php' );
 require( dirname(__FILE__) . '/classes/class.Mail.php' );
 require( dirname(__FILE__) . '/classes/class.Scan.php' );
+require( dirname(__FILE__) . '/classes/class.RouterOS.php' );
 require( dirname(__FILE__) . '/classes/class.Thread.php' );
 require( dirname(__FILE__) . '/classes/class.phpipamAgent.php' );
 
