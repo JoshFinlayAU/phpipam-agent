@@ -13,13 +13,45 @@ $config['type'] = "mysql";
 $config['key'] = "aad984d8314fcf644d3fb46886ea461f";
 
 # set scan method and path to ping file
-#	ping, fping or pear
+#	ping, fping, pear or mikrotik
+#
+#	mikrotik : instead of ICMP scanning, pull active DHCP leases from one or
+#	           more MikroTik routers via the RouterOS binary API (see the
+#	           $config['mikrotik'] block below). When 'ping_check' is enabled
+#	           fping is additionally used to set online/offline status, so
+#	           $config['pingpath'] must point at the fping binary.
 # ******************************/
 //$config['method'] 	= "pear";
 //$config['pingpath'] = "/sbin/ping";
 
 $config['method'] 	= "fping";
 $config['pingpath'] = "/usr/local/sbin/fping";
+
+# MikroTik RouterOS DHCP lease discovery (used when $config['method'] = "mikrotik")
+#
+#	'routers'     : list of routers to query. Each lease is matched into the
+#	                subnets assigned to this scan agent. Only the plaintext
+#	                binary API (default port 8728) is supported.
+#	'ping_check'  : if true, fping each leased address to set its online/offline
+#	                status (requires $config['pingpath'] to be the fping binary).
+#	'description' : text written to the address description; the lease type
+#	                "(dynamic)" or "(static)" is appended automatically.
+#	'tag_dynamic' : phpipam IP tag (ipTags.id) used for dynamic leases (4 = DHCP)
+#	'tag_static'  : phpipam IP tag (ipTags.id) used for static  leases (2 = Used)
+# ******************************/
+$config['mikrotik']['routers'] = array(
+	array(
+		'host' => "192.168.88.1",
+		'user' => "phpipam",
+		'pass' => "password",
+		'port' => 8728,
+	),
+	// add more routers here ...
+);
+$config['mikrotik']['ping_check']  = true;
+$config['mikrotik']['description'] = "MikroTik DHCP lease";
+$config['mikrotik']['tag_dynamic'] = 4;
+$config['mikrotik']['tag_static']  = 2;
 
 # permit non-threaded checks (default: false)
 # ******************************/

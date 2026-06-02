@@ -120,11 +120,14 @@ class Scan extends Common_functions {
 		$config = Config::ValueOf('config');
 
 		$this->ping_type   = $config['method'];
-		$this->ping_path   = ($this->ping_type == "ping")  ? $config['pingpath'] : '';
-		$this->fping_path  = ($this->ping_type == "fping") ? $config['pingpath'] : '';
+		# the mikrotik method has no ICMP scanner of its own - it reuses fping
+		# (when enabled) only to determine online/offline status of leases
+		$effective_method  = ($this->ping_type == "mikrotik") ? "fping" : $this->ping_type;
+		$this->ping_path   = ($effective_method == "ping")  ? $config['pingpath'] : '';
+		$this->fping_path  = ($effective_method == "fping") ? $config['pingpath'] : '';
 
 		# set type
-		$this->reset_scan_method ($this->ping_type);
+		$this->reset_scan_method ($effective_method);
 		# set OS type
 		$this->set_os_type ();
 		# set php exec

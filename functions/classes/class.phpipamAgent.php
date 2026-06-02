@@ -241,7 +241,8 @@ class phpipamAgent extends Common_functions {
 		$this->ping_types = array(
 							'ping',
 							'fping',
-							'pear'
+							'pear',
+							'mikrotik'
 							);
 	}
 
@@ -340,6 +341,10 @@ class phpipamAgent extends Common_functions {
 	 * @return void
 	 */
 	private function validate_threading () {
+		// mikrotik discovery does not fork worker threads
+		if($this->config->method == "mikrotik") {
+			return;
+		}
 		// only for threaded
 		if($this->config->nonthreaded !== true) {
 			// test to see if threading is available
@@ -356,6 +361,13 @@ class phpipamAgent extends Common_functions {
 	 * @return void
 	 */
 	private function validate_ping_path () {
+		// mikrotik only needs a ping binary when online/offline checking is enabled
+		if($this->config->method == "mikrotik") {
+			$mikrotik = isset($this->config->mikrotik) ? (array) $this->config->mikrotik : array();
+			if(empty($mikrotik['ping_check'])) {
+				return;
+			}
+		}
 		if(!file_exists($this->config->pingpath)) {
 			$this->Result->throw_exception (500, "ping executable does not exist - \$config['pingpath'] = \"".escape_input($this->config->pingpath)."\"");
 		}
@@ -378,6 +390,10 @@ class phpipamAgent extends Common_functions {
 		// if non-threaded permitted remove pcntl requirement
 		if ($this->config->nonthreaded === true) {
 			unset($required_ext[2]);
+		}
+		// mikrotik discovery does not fork worker threads (no pcntl required)
+		if ($this->config->method == "mikrotik") {
+			$required_ext = array_diff($required_ext, array("pcntl"));
 		}
 		// if api selected
 
@@ -517,6 +533,11 @@ class phpipamAgent extends Common_functions {
 
 		// initialize scan object
 		$this->scan_set_object ();
+
+		// mikrotik DHCP lease discovery - populate from RouterOS instead of ICMP scanning
+		if ($this->config->method == "mikrotik") {
+			return $this->mysql_scan_mikrotik ($this->scan_type == "discover");
+		}
 
 		// we have subnets, now check
 		return $this->scan_type == "update" ? $this->mysql_scan_update_host_statuses () : $this->mysql_scan_discover_hosts ();
@@ -1216,6 +1237,221 @@ class phpipamAgent extends Common_functions {
 		        }
 			}
 		}
+	}
+
+
+	/**
+	 * @mikrotik functions
+	 * ---------------------------------
+	 */
+
+	/**
+	 * Pulls DHCP leases from the configured MikroTik routers and writes them
+	 * to phpipam.
+	 *
+	 *	Each lease is matched into one of the subnets assigned to this agent,
+	 *	tagged as dynamic or static and (optionally) fping-checked for its
+	 *	online/offline status.
+	 *
+	 *	In "discover" mode new leases are inserted and existing addresses
+	 *	updated; in "update" mode only addresses already present in the
+	 *	database are refreshed.
+	 *
+	 * @access private
+	 * @param bool $insert_new whether brand new leases should be inserted
+	 * @return bool
+	 */
+	private function mysql_scan_mikrotik ($insert_new) {
+		// config
+		$mikrotik = isset($this->config->mikrotik) ? (array) $this->config->mikrotik : array();
+		if (empty($mikrotik['routers']) || !is_array($mikrotik['routers'])) {
+			$this->Result->throw_exception (500, "No MikroTik routers configured - \$config['mikrotik']['routers'] is empty");
+		}
+		$ping_check  = !empty($mikrotik['ping_check']);
+		$desc_prefix = isset($mikrotik['description']) ? $mikrotik['description'] : "MikroTik DHCP lease";
+		$tag_dynamic = isset($mikrotik['tag_dynamic']) ? $mikrotik['tag_dynamic'] : 4;
+		$tag_static  = isset($mikrotik['tag_static'])  ? $mikrotik['tag_static']  : 2;
+
+		// fetch subnets assigned to this agent and pre-compute their boundaries
+		$subnets = $this->mysql_fetch_subnets ($this->agent_details->id);
+		$ranges  = $this->mikrotik_subnet_ranges ($subnets);
+
+		// collect leases from all routers (socket work, before touching the db)
+		$leases = $this->mikrotik_fetch_leases ($mikrotik['routers']);
+
+		// reset db connection - it may have idled while talking to the routers
+		unset($this->Database);
+		$this->Database = new Database_PDO ();
+		$Addresses = new Addresses ($this->Database);
+
+		$inserted = 0; $updated = 0; $touched_subnets = array();
+
+		foreach ($leases as $lease) {
+			// RouterOS uses 'address' for the leased IP
+			if (empty($lease['address']) || filter_var($lease['address'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+				continue;
+			}
+			$ip_dotted  = $lease['address'];
+			$ip_decimal = $this->transform_to_decimal ($ip_dotted);
+
+			// find the agent subnet this lease belongs to
+			$subnetId = $this->mikrotik_match_subnet ($ip_decimal, $ranges);
+			if ($subnetId === false) {
+				continue;
+			}
+
+			// dynamic vs static lease
+			$is_dynamic = isset($lease['dynamic']) && $lease['dynamic'] === "true";
+			$lease_type = $is_dynamic ? "dynamic" : "static";
+			$state      = $is_dynamic ? $tag_dynamic : $tag_static;
+
+			// hostname / mac
+			$hostname = isset($lease['host-name']) ? $lease['host-name'] : "";
+			$mac      = isset($lease['mac-address']) ? strtolower($lease['mac-address']) : "";
+
+			// online status
+			if ($ping_check) {
+				$online = $this->Scan->ping_address ($ip_dotted) == 0;
+			} else {
+				// trust the RouterOS lease status when not pinging
+				$online = isset($lease['status']) ? ($lease['status'] === "bound") : true;
+			}
+
+			$description = $desc_prefix." (".$lease_type.")";
+			$note        = "MikroTik DHCP ".$lease_type." lease imported on ".$this->nowdate." by agent ".$this->agent_details->name;
+
+			// already known ?
+			$existing = $Addresses->fetch_address_multiple_criteria ($ip_decimal, $subnetId);
+
+			if (is_object($existing)) {
+				$values = array(
+					"id"          => $existing->id,
+					"mac"         => $mac,
+					"description" => $description,
+					"note"        => $note,
+					"state"       => $state,
+				);
+				if (strlen($hostname) > 0)	{ $values['hostname'] = $hostname; }
+				if ($online)				{ $values['lastSeen']  = $this->nowdate; }
+
+				try { $this->Database->updateObject("ipaddresses", $values, "id"); $updated++; }
+				catch (Exception $e) { $this->Result->throw_exception (500, "Error: ".$e->getMessage()); }
+			}
+			elseif ($insert_new) {
+				$values = array(
+					"subnetId"    => $subnetId,
+					"ip_addr"     => $ip_decimal,
+					"mac"         => $mac,
+					"hostname"    => $hostname,
+					"description" => $description,
+					"note"        => $note,
+					"state"       => $state,
+					"lastSeen"    => $online ? $this->nowdate : "0000-00-00 00:00:00",
+				);
+				$this->mysql_insert_address ($values);
+				$inserted++;
+			}
+			else {
+				continue;
+			}
+
+			$touched_subnets[$subnetId] = true;
+		}
+
+		// update subnet scan timestamps
+		foreach (array_keys($touched_subnets) as $sid) {
+			if ($insert_new)	{ $this->update_subnet_discovery_scantime ($sid); }
+			else				{ $this->update_subnet_status_scantime ($sid); }
+		}
+
+		$this->print_success ("MikroTik DHCP import complete: ".$inserted." inserted, ".$updated." updated.");
+
+		return true;
+	}
+
+	/**
+	 * Pre-computes the decimal network/broadcast boundaries for each subnet so
+	 * leases can be matched into the right subnet.
+	 *
+	 * @access private
+	 * @param array $subnets
+	 * @return array  list of array("id"=>, "min"=>, "max"=>)
+	 */
+	private function mikrotik_subnet_ranges ($subnets) {
+		$ranges = array();
+		if (!is_array($subnets)) {
+			return $ranges;
+		}
+		$Subnets = new Subnets ($this->Database);
+		foreach ($subnets as $s) {
+			// only IPv4 subnets can hold MikroTik DHCP leases
+			if ($this->identify_address ($this->transform_to_dotted($s->subnet)) != "IPv4") {
+				continue;
+			}
+			$b = (object) $Subnets->get_network_boundaries ($s->subnet, $s->mask);
+			$ranges[] = array(
+				"id"  => $s->id,
+				"min" => $this->transform_to_decimal ($b->network),
+				"max" => $this->transform_to_decimal ($b->broadcast),
+			);
+		}
+		return $ranges;
+	}
+
+	/**
+	 * Returns the id of the subnet that contains the given decimal IP, or
+	 * false when the IP is outside every assigned subnet.
+	 *
+	 * @access private
+	 * @param string $ip_decimal
+	 * @param array  $ranges
+	 * @return int|false
+	 */
+	private function mikrotik_match_subnet ($ip_decimal, $ranges) {
+		foreach ($ranges as $r) {
+			if (gmp_cmp($ip_decimal, $r['min']) >= 0 && gmp_cmp($ip_decimal, $r['max']) <= 0) {
+				return $r['id'];
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Connects to every configured router and returns the combined list of
+	 * DHCP leases. A single unreachable router does not abort the run.
+	 *
+	 * @access private
+	 * @param array $routers
+	 * @return array
+	 */
+	private function mikrotik_fetch_leases ($routers) {
+		$leases = array();
+		foreach ($routers as $r) {
+			if (empty($r['host'])) {
+				continue;
+			}
+			$port = isset($r['port']) ? $r['port'] : 8728;
+			$user = isset($r['user']) ? $r['user'] : "";
+			$pass = isset($r['pass']) ? $r['pass'] : "";
+
+			try {
+				$api = new RouterOS_API ($r['host'], $user, $pass, $port);
+				$api->connect ();
+				$api->login ();
+				$router_leases = $api->get_dhcp_leases ();
+				$api->disconnect ();
+			}
+			catch (Exception $e) {
+				// keep going - one bad router shouldn't kill the whole import
+				$this->print_success ("Warning: MikroTik ".$r['host']." - ".$e->getMessage());
+				continue;
+			}
+
+			foreach ($router_leases as $l) {
+				$leases[] = $l;
+			}
+		}
+		return $leases;
 	}
 
 
