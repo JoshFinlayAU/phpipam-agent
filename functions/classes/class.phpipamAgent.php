@@ -1317,7 +1317,13 @@ class phpipamAgent extends Common_functions {
 				$online = isset($lease['status']) ? ($lease['status'] === "bound") : true;
 			}
 
-			$description = $desc_prefix." (".$lease_type.")";
+			// description - for static leases prefer the RouterOS comment when set
+			$comment = isset($lease['comment']) ? trim($lease['comment']) : "";
+			if (!$is_dynamic && strlen($comment) > 0) {
+				$description = $comment;
+			} else {
+				$description = $desc_prefix." (".$lease_type.")";
+			}
 			$note        = "MikroTik DHCP ".$lease_type." lease imported on ".$this->nowdate." by agent ".$this->agent_details->name;
 
 			// already known ?
